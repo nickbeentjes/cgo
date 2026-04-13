@@ -1,60 +1,48 @@
 #!/usr/bin/env python3
 """
-cgo — Claude Code project navigator
-Find every Claude Code project on your machine, jump to it, and launch claude.
+go — Claude Code project navigator
+Find all Claude Code projects, navigate with arrow keys, launch with Enter.
 """
 
 import curses
 import os
 import re
-import shutil
 import subprocess
 import sys
 import threading
 from pathlib import Path
 
-# ── Auto-detect claude binary ────────────────────────────────────────────────
-def _find_claude():
-    for candidate in [
-        shutil.which('claude'),
-        Path.home() / '.local' / 'bin' / 'claude',
-        '/usr/local/bin/claude',
-    ]:
-        if candidate and Path(candidate).exists():
-            return str(candidate)
-    return 'claude'  # fall back to PATH
-
-CLAUDE_BINARY = _find_claude()
-
-# ── Defaults (can be overridden by env vars) ─────────────────────────────────
-SEARCH_ROOT  = Path(os.environ.get('CGO_SEARCH_ROOT', Path.home()))
-CLONE_ROOT   = Path(os.environ.get('CGO_CLONE_DIR',  Path.home()))
-GITHUB_USER  = os.environ.get(
-    'CGO_GITHUB_USER',
-    subprocess.check_output(['git', 'config', '--global', 'github.user'],
-                            stderr=subprocess.DEVNULL, text=True).strip()
-    if shutil.which('git') else ''
-)
-
+CLAUDE_BINARY = '/Users/kees/.local/bin/claude'
+SEARCH_ROOT = Path.home()
+CLONE_ROOT = Path('/Users/kees/.nick')  # where cloned repos land
+GITHUB_USER = 'nickbeentjes'
 MAX_DEPTH = 8
+SKIP_DIRS = {
+    'node_modules', '__pycache__', '.venv', 'venv', 'env',
+    'Library', 'Applications', 'Music', 'Movies', 'Pictures',
+    'Downloads', 'Desktop', '.Trash', 'build', 'dist', '.npm',
+    '.cache', 'site-packages', 'Pods', 'DerivedData', '.gradle',
+}
+
+
 CACHE_FILE = Path.home() / '.cache' / 'cgo_dirs.txt'
-CACHE_MAX_AGE = 3600  # seconds
+CACHE_MAX_AGE = 3600  # seconds — rescan after 1 hour
 
-
-# ── Conversation detection ───────────────────────────────────────────────────
 
 def has_conversations(project_dir: Path) -> bool:
-    """Return True if Claude Code has saved conversations for this directory."""
+    """Check if Claude Code has any saved conversations for this directory."""
     encoded = re.sub(r'[^a-zA-Z0-9]', '-', str(project_dir))
     conv_dir = Path.home() / '.claude' / 'projects' / encoded
-    return conv_dir.exists() and any(conv_dir.glob('*.jsonl'))
+    if not conv_dir.exists():
+        return False
+    return any(conv_dir.glob('*.jsonl'))
 
 
-# ── Directory discovery ──────────────────────────────────────────────────────
-
-def _is_noise_dir(path: Path) -> bool:
-    """Filter GSD worktrees, nested hits, and other non-root dirs."""
+def is_gsd_subdir(path: Path) -> bool:
+    """True if this looks like a GSD workspace/worktree sub-directory, not a real project."""
     parts = path.parts
+    # GSD creates worktrees under .planning/worktrees/ or workspaces under .nick/
+    # Filter out anything whose parent already has .claude (it's a nested hit, not a project root)
     for i in range(len(parts) - 1):
         parent = Path(*parts[:i + 1])
         if (parent / '.planning').exists() and parent != path:
@@ -62,55 +50,12 @@ def _is_noise_dir(path: Path) -> bool:
     return False
 
 
-def _find(home: str, name: str, extra_prunes: list[str]) -> set[Path]:
-    prunes = ['-not', '-path', '*/node_modules/*',
-              '-not', '-path', '*/.git/*',
-              '-not', '-path', '*/Library/*',
-              '-not', '-path', '*/DerivedData/*']
-    for p in extra_prunes:
-        prunes += ['-not', '-path', p]
-    try:
-        out = subprocess.check_output(
-            ['find', home, '-maxdepth', str(MAX_DEPTH), '-name', name, *prunes],
-            stderr=subprocess.DEVNULL, text=True, timeout=30
-        )
-        return {Path(l) for l in out.strip().splitlines() if l}
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
-        return set()
-
-
-def find_claude_dirs(force_rescan: bool = False) -> list[Path]:
-    if not force_rescan:
-        cached = _load_cache()
-        if cached is not None:
-            return cached
-
-    home = str(SEARCH_ROOT)
-    global_claude = SEARCH_ROOT / '.claude'
-    results: set[Path] = set()
-
-    # .claude dirs → parent is the project root
-    for p in _find(home, '.claude', []):
-        if p == global_claude or p.parent == global_claude:
-            continue
-        results.add(p.parent)
-
-    # CLAUDE.md files → their directory is the project root
-    for p in _find(home, 'CLAUDE.md', []):
-        results.add(p.parent)
-
-    filtered = sorted(d for d in results if not _is_noise_dir(d))
-    _save_cache(filtered)
-    return filtered
-
-
-# ── Cache ────────────────────────────────────────────────────────────────────
-
-def _load_cache() -> list[Path] | None:
+def load_cache():
     import time
     if not CACHE_FILE.exists():
         return None
-    if time.time() - CACHE_FILE.stat().st_mtime > CACHE_MAX_AGE:
+    age = time.time() - CACHE_FILE.stat().st_mtime
+    if age > CACHE_MAX_AGE:
         return None
     try:
         lines = CACHE_FILE.read_text().strip().splitlines()
@@ -119,7 +64,7 @@ def _load_cache() -> list[Path] | None:
         return None
 
 
-def _save_cache(dirs: list[Path]) -> None:
+def save_cache(dirs):
     try:
         CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
         CACHE_FILE.write_text('\n'.join(str(d) for d in dirs))
@@ -127,141 +72,224 @@ def _save_cache(dirs: list[Path]) -> None:
         pass
 
 
-# ── Formatting ───────────────────────────────────────────────────────────────
+def find_claude_dirs(force_rescan=False):
+    """Locate directories with Claude Code activity, with caching."""
+    if not force_rescan:
+        cached = load_cache()
+        if cached is not None:
+            return cached
+
+    home = str(SEARCH_ROOT)
+    global_claude = SEARCH_ROOT / '.claude'
+    results = set()
+
+    # Build session index from ~/.claude/projects/ — the authoritative source.
+    # Encoding: re.sub(r'[^a-zA-Z0-9]', '-', str(path))
+    # We can't reverse it perfectly, so instead we encode every candidate dir
+    # and check if it matches a known session entry. O(1) lookup per dir.
+    session_encoded: set[str] = set()
+    claude_projects = SEARCH_ROOT / '.claude' / 'projects'
+    if claude_projects.exists():
+        session_encoded = {
+            entry.name
+            for entry in claude_projects.iterdir()
+            if entry.is_dir() and any(entry.glob('*.jsonl'))
+        }
+
+    # Single find pass — check each dir against all three conditions
+    try:
+        out = subprocess.check_output(
+            ['find', home, '-maxdepth', str(MAX_DEPTH), '-type', 'd',
+             '-not', '-path', '*/node_modules/*',
+             '-not', '-path', '*/.git/*',
+             '-not', '-path', '*/Library/*',
+             '-not', '-path', '*/DerivedData/*',
+             '-not', '-path', '*/.npm/*',
+             '-not', '-path', '*/__pycache__/*',
+             '-not', '-path', '*/Pods/*'],
+            stderr=subprocess.DEVNULL, text=True, timeout=60
+        )
+        for line in out.strip().splitlines():
+            p = Path(line)
+            s = str(p)
+
+            # Skip anything inside ~/.claude (global config, not a project)
+            if s.startswith(str(global_claude)):
+                continue
+
+            # Condition 1: has a Claude session in ~/.claude/projects/
+            if session_encoded:
+                if re.sub(r'[^a-zA-Z0-9]', '-', s) in session_encoded:
+                    results.add(p)
+                    continue
+
+            # Condition 2: has a .claude/ subdir inside the project
+            if (p / '.claude').exists():
+                results.add(p)
+                continue
+
+            # Condition 3: has a CLAUDE.md
+            if (p / 'CLAUDE.md').exists():
+                results.add(p)
+
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        pass
+
+    # Filter out GSD worktree/workspace sub-directories
+    filtered = [d for d in sorted(results) if not is_gsd_subdir(d)]
+
+    save_cache(filtered)
+    return filtered
+
 
 def fmt(p: Path) -> str:
+    """Format path for display using ~ shorthand."""
     try:
-        return '~/' + str(p.relative_to(Path.home()))
+        rel = p.relative_to(SEARCH_ROOT)
+        return '~/' + str(rel)
     except ValueError:
         return str(p)
 
 
-# ── TUI ──────────────────────────────────────────────────────────────────────
-
 class App:
     def __init__(self, stdscr):
-        self.stdscr     = stdscr
-        self.all_dirs:  list[Path] = []
-        self.filtered:  list[Path] = []
-        self.selected   = 0
-        self.scroll     = 0
-        self.query      = ''
-        self.filter_mode  = False
-        self.clone_mode   = False
-        self.clone_input  = ''
-        self.clone_status = ''
-        self.clone_error  = False
-        self.loading      = True
+        self.stdscr = stdscr
+        self.all_dirs = []
+        self.filtered = []
+        self.selected = 0
+        self.scroll = 0
+        self.query = ''
+        self.filter_mode = False
+        self.clone_mode = False
+        self.clone_input = ''
+        self.clone_status = ''   # feedback line after clone attempt
+        self.clone_error = False
+        self.loading = True
+        self.status = ''
 
         curses.curs_set(0)
         curses.start_color()
         curses.use_default_colors()
-        curses.init_pair(1, curses.COLOR_CYAN,  -1)                       # header/footer
-        curses.init_pair(2, curses.COLOR_BLACK, curses.COLOR_CYAN)        # selected row
-        curses.init_pair(3, curses.COLOR_GREEN, -1)                       # normal row
-        curses.init_pair(4, curses.COLOR_YELLOW, -1)                      # filter/input
-        curses.init_pair(5, curses.COLOR_WHITE,  -1)                      # dim
-        curses.init_pair(6, curses.COLOR_RED,    -1)                      # error
-        self.stdscr.timeout(100)
 
-    # ── Search ───────────────────────────────────────────────────────────────
+        # Color scheme
+        curses.init_pair(1, curses.COLOR_CYAN,   -1)          # header / footer
+        curses.init_pair(2, curses.COLOR_BLACK,  curses.COLOR_CYAN)   # selected row
+        curses.init_pair(3, curses.COLOR_GREEN,  -1)          # normal row
+        curses.init_pair(4, curses.COLOR_YELLOW, -1)          # filter input
+        curses.init_pair(5, curses.COLOR_WHITE,  -1)          # dim text
+        curses.init_pair(6, curses.COLOR_RED,    -1)          # error
 
-    def start_search(self, force_rescan: bool = False):
+        self.stdscr.timeout(100)  # 100ms timeout for getch (for spinner)
+
+    def start_search(self, force_rescan=False):
         self.loading = True
-        def _worker():
-            self.all_dirs = find_claude_dirs(force_rescan=force_rescan)
+        def worker():
+            dirs = find_claude_dirs(force_rescan=force_rescan)
+            self.all_dirs = dirs
             self.apply_filter()
             self.loading = False
-        threading.Thread(target=_worker, daemon=True).start()
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
 
     def apply_filter(self):
         q = self.query.lower()
-        self.filtered = self.all_dirs[:] if not q else [
-            d for d in self.all_dirs if q in fmt(d).lower()
-        ]
+        if not q:
+            self.filtered = self.all_dirs[:]
+        else:
+            self.filtered = [d for d in self.all_dirs if q in fmt(d).lower()]
         self.selected = 0
-        self.scroll    = 0
-
-    # ── Drawing ──────────────────────────────────────────────────────────────
+        self.scroll = 0
 
     def draw(self):
         h, w = self.stdscr.getmaxyx()
         self.stdscr.erase()
 
-        # Header
+        # ── Header ──────────────────────────────────────────────────────────
+        header = '  ⚡ go  —  Claude Code Project Navigator  '
         self.stdscr.attron(curses.color_pair(1) | curses.A_BOLD)
-        self.stdscr.addstr(0, 0, '  ⚡ cGo  '.ljust(w)[:w])
+        self.stdscr.addstr(0, 0, header.ljust(w)[:w])
         self.stdscr.attroff(curses.color_pair(1) | curses.A_BOLD)
 
-        # Spinner while loading
+        # ── Loading spinner ──────────────────────────────────────────────────
         if self.loading:
+            frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
             import time
-            frame = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'[int(time.time() * 10) % 10]
+            frame = frames[int(time.time() * 10) % len(frames)]
+            msg = f'  {frame}  Scanning for Claude Code projects…'
             self.stdscr.attron(curses.color_pair(5))
-            self.stdscr.addstr(2, 0, f'  {frame}  Scanning for Claude Code projects…'[:w])
+            self.stdscr.addstr(2, 0, msg[:w])
             self.stdscr.attroff(curses.color_pair(5))
             self.stdscr.refresh()
             return
 
-        # List
-        list_h = h - 3
-        dirs   = self.filtered
+        # ── Directory list ───────────────────────────────────────────────────
+        list_h = h - 3  # rows for the list (header + footer)
+        dirs = self.filtered
+
         if not dirs:
             self.stdscr.attron(curses.color_pair(5))
-            self.stdscr.addstr(2, 0, '  (no projects found)'[:w])
+            self.stdscr.addstr(2, 0, '  (no projects found)' [:w])
             self.stdscr.attroff(curses.color_pair(5))
         else:
+            # Clamp scroll so selected is always visible
             if self.selected < self.scroll:
                 self.scroll = self.selected
             elif self.selected >= self.scroll + list_h:
                 self.scroll = self.selected - list_h + 1
 
-            for i, d in enumerate(dirs[self.scroll:self.scroll + list_h]):
-                idx     = i + self.scroll
-                label   = fmt(d)
-                marker  = ' ✦' if (d / '.planning').exists() else ''
+            visible = dirs[self.scroll:self.scroll + list_h]
+            for i, d in enumerate(visible):
+                row = i + 1
+                idx = i + self.scroll
+                label = fmt(d)
+                # Check if project has a .planning dir (GSD projects get a marker)
+                marker = ' ✦' if (d / '.planning').exists() else ''
                 display = f'  {label}{marker}'
                 if len(display) > w - 1:
                     display = '  …' + label[-(w - 6):] + marker
 
                 if idx == self.selected:
                     self.stdscr.attron(curses.color_pair(2) | curses.A_BOLD)
-                    self.stdscr.addstr(i + 1, 0, display.ljust(w)[:w])
+                    self.stdscr.addstr(row, 0, display.ljust(w)[:w])
                     self.stdscr.attroff(curses.color_pair(2) | curses.A_BOLD)
                 else:
                     self.stdscr.attron(curses.color_pair(3))
                     try:
-                        self.stdscr.addstr(i + 1, 0, display[:w - 1])
+                        self.stdscr.addstr(row, 0, display[:w - 1])
                     except curses.error:
                         pass
                     self.stdscr.attroff(curses.color_pair(3))
 
-        # Clone overlay (drawn on top of list)
+        # ── Clone overlay ────────────────────────────────────────────────────
         if self.clone_mode:
             self._draw_clone_overlay(h, w)
             return
 
-        # Footer
+        # ── Footer ───────────────────────────────────────────────────────────
         if self.filter_mode:
             footer = f'  / {self.query}█'
             self.stdscr.attron(curses.color_pair(4) | curses.A_BOLD)
         else:
-            count  = f'{self.selected + 1}/{len(dirs)}' if dirs else '0/0'
+            count = f'{self.selected + 1}/{len(dirs)}' if dirs else '0/0'
             footer = f'  ↑↓ navigate   enter launch   / filter   c clone   r rescan   q quit   [{count}]'
             self.stdscr.attron(curses.color_pair(1))
+
         try:
             self.stdscr.addstr(h - 1, 0, footer.ljust(w)[:w])
         except curses.error:
             pass
         self.stdscr.attroff(curses.color_pair(1) | curses.color_pair(4) | curses.A_BOLD)
+
         self.stdscr.refresh()
 
-    def _draw_clone_overlay(self, h: int, w: int):
-        box_w = min(w - 4, 72)
+    def _draw_clone_overlay(self, h, w):
+        """Draw the clone input box over the list."""
+        box_w = min(w - 4, 70)
         box_h = 7
         box_y = max(1, h // 2 - box_h // 2)
         box_x = (w - box_w) // 2
 
+        # Shadow / backdrop rows
         for row in range(box_y, box_y + box_h):
             self.stdscr.attron(curses.color_pair(5))
             try:
@@ -278,18 +306,66 @@ class App:
                 pass
             self.stdscr.attroff(curses.color_pair(pair) | attrs)
 
-        put(0, 0, f'  Clone a GitHub repo into {CLONE_ROOT.name}/  '.ljust(box_w), 1, curses.A_BOLD)
+        put(0, 0, f'  Clone a GitHub repo into {CLONE_ROOT.name}/  '.ljust(box_w),
+            1, curses.A_BOLD)
         put(1, 0, '', 5)
-        put(2, 2, 'Repo  (name  or  user/repo  or  full URL):', 5)
+        put(2, 2, 'Repo name  (or user/repo):', 5)
         put(3, 2, f'  {self.clone_input}█'.ljust(box_w - 4), 4, curses.A_BOLD)
         put(4, 0, '', 5)
+
         if self.clone_status:
-            put(5, 2, self.clone_status[:(box_w - 4)], 6 if self.clone_error else 3)
+            pair = 6 if self.clone_error else 3
+            put(5, 2, self.clone_status[:(box_w - 4)], pair)
         else:
             put(5, 2, 'enter confirm   esc cancel', 5)
+
         self.stdscr.refresh()
 
-    # ── Actions ──────────────────────────────────────────────────────────────
+    def do_clone(self):
+        """Run git clone from the input, then launch claude in the new dir."""
+        repo = self.clone_input.strip()
+        if not repo:
+            return
+
+        # Resolve to a full SSH URL if only a short name was given
+        if '/' not in repo:
+            repo = f'{GITHUB_USER}/{repo}'
+        if not repo.startswith(('git@', 'http://', 'https://')):
+            ssh_url = f'git@github.com:{repo}.git'
+        else:
+            ssh_url = repo
+
+        # Derive local dir name from repo slug
+        name = repo.rstrip('/').split('/')[-1]
+        if name.endswith('.git'):
+            name = name[:-4]
+        dest = CLONE_ROOT / name
+
+        self.clone_status = f'Cloning {ssh_url} …'
+        self.clone_error = False
+        self.draw()
+
+        try:
+            result = subprocess.run(
+                ['git', 'clone', ssh_url, str(dest)],
+                capture_output=True, text=True, timeout=120
+            )
+        except subprocess.TimeoutExpired:
+            self.clone_status = 'Error: clone timed out'
+            self.clone_error = True
+            return
+
+        if result.returncode != 0:
+            msg = (result.stderr or result.stdout).strip().splitlines()[-1]
+            self.clone_status = f'Error: {msg}'
+            self.clone_error = True
+            return
+
+        # Success — leave curses and launch claude fresh (no --continue)
+        curses.endwin()
+        os.chdir(dest)
+        print(f'\n  Cloned → {dest}\n')
+        os.execv(CLAUDE_BINARY, [CLAUDE_BINARY, '--dangerously-skip-permissions'])
 
     def launch(self):
         if not self.filtered:
@@ -303,81 +379,39 @@ class App:
             args.insert(1, '--continue')
         os.execv(CLAUDE_BINARY, args)
 
-    def do_clone(self):
-        repo = self.clone_input.strip()
-        if not repo:
-            return
-
-        # Resolve URL
-        if repo.startswith(('git@', 'http://', 'https://')):
-            url = repo
-        else:
-            if '/' not in repo:
-                repo = f'{GITHUB_USER}/{repo}' if GITHUB_USER else repo
-            url = f'git@github.com:{repo}.git'
-
-        # Destination dir name
-        name = repo.rstrip('/').split('/')[-1].removesuffix('.git')
-        dest = CLONE_ROOT / name
-
-        self.clone_status = f'Cloning {url} …'
-        self.clone_error  = False
-        self.draw()
-
-        try:
-            result = subprocess.run(
-                ['git', 'clone', url, str(dest)],
-                capture_output=True, text=True, timeout=120
-            )
-        except subprocess.TimeoutExpired:
-            self.clone_status = 'Error: clone timed out'
-            self.clone_error  = True
-            return
-
-        if result.returncode != 0:
-            msg = (result.stderr or result.stdout).strip().splitlines()[-1]
-            self.clone_status = f'Error: {msg}'
-            self.clone_error  = True
-            return
-
-        curses.endwin()
-        os.chdir(dest)
-        print(f'\n  Cloned → {dest}\n')
-        os.execv(CLAUDE_BINARY, [CLAUDE_BINARY, '--dangerously-skip-permissions'])
-
-    # ── Event loop ───────────────────────────────────────────────────────────
-
     def run(self):
         self.start_search()
+
         while True:
             self.draw()
             key = self.stdscr.getch()
+
             if key == -1:
-                continue
+                continue  # timeout, redraw (for spinner)
 
             if self.clone_mode:
-                if key == 27:
-                    self.clone_mode   = False
-                    self.clone_input  = ''
+                if key in (27,):  # ESC — cancel
+                    self.clone_mode = False
+                    self.clone_input = ''
                     self.clone_status = ''
-                    self.clone_error  = False
+                    self.clone_error = False
                 elif key in (curses.KEY_ENTER, 10, 13):
                     if self.clone_input.strip():
                         self.do_clone()
+                        # do_clone either exec'd or set an error; if error, stay in clone mode
                 elif key in (curses.KEY_BACKSPACE, 127, 8):
-                    self.clone_input  = self.clone_input[:-1]
+                    self.clone_input = self.clone_input[:-1]
                     self.clone_status = ''
-                    self.clone_error  = False
+                    self.clone_error = False
                 elif 32 <= key <= 126:
                     self.clone_input += chr(key)
                     self.clone_status = ''
-                    self.clone_error  = False
-
+                    self.clone_error = False
             elif self.filter_mode:
                 if key in (curses.KEY_ENTER, 10, 13):
                     self.filter_mode = False
-                elif key == 27:
-                    self.query       = ''
+                elif key in (27,):  # ESC — clear filter
+                    self.query = ''
                     self.filter_mode = False
                     self.apply_filter()
                 elif key in (curses.KEY_BACKSPACE, 127, 8):
@@ -386,32 +420,37 @@ class App:
                 elif 32 <= key <= 126:
                     self.query += chr(key)
                     self.apply_filter()
-
             else:
-                h, _ = self.stdscr.getmaxyx()
                 if key in (ord('q'), ord('Q'), 27):
-                    curses.endwin(); sys.exit(0)
-                elif key in (curses.KEY_UP,   ord('k')) and self.selected > 0:
-                    self.selected -= 1
-                elif key in (curses.KEY_DOWN, ord('j')) and self.filtered and self.selected < len(self.filtered) - 1:
-                    self.selected += 1
-                elif key == curses.KEY_PPAGE:
+                    curses.endwin()
+                    sys.exit(0)
+                elif key in (curses.KEY_UP, ord('k')):
+                    if self.selected > 0:
+                        self.selected -= 1
+                elif key in (curses.KEY_DOWN, ord('j')):
+                    if self.filtered and self.selected < len(self.filtered) - 1:
+                        self.selected += 1
+                elif key in (curses.KEY_PPAGE,):  # Page Up
+                    h, _ = self.stdscr.getmaxyx()
                     self.selected = max(0, self.selected - (h - 3))
-                elif key == curses.KEY_NPAGE and self.filtered:
-                    self.selected = min(len(self.filtered) - 1, self.selected + (h - 3))
-                elif key == curses.KEY_HOME:
+                elif key in (curses.KEY_NPAGE,):  # Page Down
+                    h, _ = self.stdscr.getmaxyx()
+                    if self.filtered:
+                        self.selected = min(len(self.filtered) - 1, self.selected + (h - 3))
+                elif key in (curses.KEY_HOME,):
                     self.selected = 0
-                elif key == curses.KEY_END and self.filtered:
-                    self.selected = len(self.filtered) - 1
+                elif key in (curses.KEY_END,):
+                    if self.filtered:
+                        self.selected = len(self.filtered) - 1
                 elif key == ord('/'):
                     self.filter_mode = True
                 elif key in (ord('r'), ord('R')):
                     self.start_search(force_rescan=True)
                 elif key in (ord('c'), ord('C')):
-                    self.clone_mode   = True
-                    self.clone_input  = ''
+                    self.clone_mode = True
+                    self.clone_input = ''
                     self.clone_status = ''
-                    self.clone_error  = False
+                    self.clone_error = False
                 elif key in (curses.KEY_ENTER, 10, 13):
                     self.launch()
 
