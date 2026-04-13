@@ -190,7 +190,7 @@ class App:
 
         # Header
         self.stdscr.attron(curses.color_pair(1) | curses.A_BOLD)
-        self.stdscr.addstr(0, 0, '  ⚡ cgo  —  Claude Code Project Navigator  '.ljust(w)[:w])
+        self.stdscr.addstr(0, 0, '  ⚡ cGo  '.ljust(w)[:w])
         self.stdscr.attroff(curses.color_pair(1) | curses.A_BOLD)
 
         # Spinner while loading

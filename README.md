@@ -1,6 +1,6 @@
-# cgo — Claude Code Project Navigator
+# cGo
 
-A terminal UI for jumping between Claude Code projects instantly.
+Jump between Claude Code projects instantly.
 
 ![cgo demo](https://raw.githubusercontent.com/nickbeentjes/cgo/main/demo.gif)
 
@@ -9,7 +9,7 @@ A terminal UI for jumping between Claude Code projects instantly.
 `cgo` scans your home directory for every project that has Claude Code activity (`.claude/` folders, `CLAUDE.md` files), shows them in a scrollable list, and launches `claude` in whichever one you pick — automatically passing `--continue` if there are saved conversations, or starting fresh if not.
 
 ```
-  ⚡ cgo  —  Claude Code Project Navigator
+  ⚡ cGo
   ~/code/my-api
   ~/code/my-app ✦
   ~/work/backend-service
