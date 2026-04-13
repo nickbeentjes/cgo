@@ -1,0 +1,427 @@
+#!/usr/bin/env python3
+"""
+cgo — Claude Code project navigator
+Find every Claude Code project on your machine, jump to it, and launch claude.
+"""
+
+import curses
+import os
+import re
+import shutil
+import subprocess
+import sys
+import threading
+from pathlib import Path
+
+# ── Auto-detect claude binary ────────────────────────────────────────────────
+def _find_claude():
+    for candidate in [
+        shutil.which('claude'),
+        Path.home() / '.local' / 'bin' / 'claude',
+        '/usr/local/bin/claude',
+    ]:
+        if candidate and Path(candidate).exists():
+            return str(candidate)
+    return 'claude'  # fall back to PATH
+
+CLAUDE_BINARY = _find_claude()
+
+# ── Defaults (can be overridden by env vars) ─────────────────────────────────
+SEARCH_ROOT  = Path(os.environ.get('CGO_SEARCH_ROOT', Path.home()))
+CLONE_ROOT   = Path(os.environ.get('CGO_CLONE_DIR',  Path.home()))
+GITHUB_USER  = os.environ.get(
+    'CGO_GITHUB_USER',
+    subprocess.check_output(['git', 'config', '--global', 'github.user'],
+                            stderr=subprocess.DEVNULL, text=True).strip()
+    if shutil.which('git') else ''
+)
+
+MAX_DEPTH = 8
+CACHE_FILE = Path.home() / '.cache' / 'cgo_dirs.txt'
+CACHE_MAX_AGE = 3600  # seconds
+
+
+# ── Conversation detection ───────────────────────────────────────────────────
+
+def has_conversations(project_dir: Path) -> bool:
+    """Return True if Claude Code has saved conversations for this directory."""
+    encoded = re.sub(r'[^a-zA-Z0-9]', '-', str(project_dir))
+    conv_dir = Path.home() / '.claude' / 'projects' / encoded
+    return conv_dir.exists() and any(conv_dir.glob('*.jsonl'))
+
+
+# ── Directory discovery ──────────────────────────────────────────────────────
+
+def _is_noise_dir(path: Path) -> bool:
+    """Filter GSD worktrees, nested hits, and other non-root dirs."""
+    parts = path.parts
+    for i in range(len(parts) - 1):
+        parent = Path(*parts[:i + 1])
+        if (parent / '.planning').exists() and parent != path:
+            return True
+    return False
+
+
+def _find(home: str, name: str, extra_prunes: list[str]) -> set[Path]:
+    prunes = ['-not', '-path', '*/node_modules/*',
+              '-not', '-path', '*/.git/*',
+              '-not', '-path', '*/Library/*',
+              '-not', '-path', '*/DerivedData/*']
+    for p in extra_prunes:
+        prunes += ['-not', '-path', p]
+    try:
+        out = subprocess.check_output(
+            ['find', home, '-maxdepth', str(MAX_DEPTH), '-name', name, *prunes],
+            stderr=subprocess.DEVNULL, text=True, timeout=30
+        )
+        return {Path(l) for l in out.strip().splitlines() if l}
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return set()
+
+
+def find_claude_dirs(force_rescan: bool = False) -> list[Path]:
+    if not force_rescan:
+        cached = _load_cache()
+        if cached is not None:
+            return cached
+
+    home = str(SEARCH_ROOT)
+    global_claude = SEARCH_ROOT / '.claude'
+    results: set[Path] = set()
+
+    # .claude dirs → parent is the project root
+    for p in _find(home, '.claude', []):
+        if p == global_claude or p.parent == global_claude:
+            continue
+        results.add(p.parent)
+
+    # CLAUDE.md files → their directory is the project root
+    for p in _find(home, 'CLAUDE.md', []):
+        results.add(p.parent)
+
+    filtered = sorted(d for d in results if not _is_noise_dir(d))
+    _save_cache(filtered)
+    return filtered
+
+
+# ── Cache ────────────────────────────────────────────────────────────────────
+
+def _load_cache() -> list[Path] | None:
+    import time
+    if not CACHE_FILE.exists():
+        return None
+    if time.time() - CACHE_FILE.stat().st_mtime > CACHE_MAX_AGE:
+        return None
+    try:
+        lines = CACHE_FILE.read_text().strip().splitlines()
+        return [Path(l) for l in lines if l]
+    except Exception:
+        return None
+
+
+def _save_cache(dirs: list[Path]) -> None:
+    try:
+        CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        CACHE_FILE.write_text('\n'.join(str(d) for d in dirs))
+    except Exception:
+        pass
+
+
+# ── Formatting ───────────────────────────────────────────────────────────────
+
+def fmt(p: Path) -> str:
+    try:
+        return '~/' + str(p.relative_to(Path.home()))
+    except ValueError:
+        return str(p)
+
+
+# ── TUI ──────────────────────────────────────────────────────────────────────
+
+class App:
+    def __init__(self, stdscr):
+        self.stdscr     = stdscr
+        self.all_dirs:  list[Path] = []
+        self.filtered:  list[Path] = []
+        self.selected   = 0
+        self.scroll     = 0
+        self.query      = ''
+        self.filter_mode  = False
+        self.clone_mode   = False
+        self.clone_input  = ''
+        self.clone_status = ''
+        self.clone_error  = False
+        self.loading      = True
+
+        curses.curs_set(0)
+        curses.start_color()
+        curses.use_default_colors()
+        curses.init_pair(1, curses.COLOR_CYAN,  -1)                       # header/footer
+        curses.init_pair(2, curses.COLOR_BLACK, curses.COLOR_CYAN)        # selected row
+        curses.init_pair(3, curses.COLOR_GREEN, -1)                       # normal row
+        curses.init_pair(4, curses.COLOR_YELLOW, -1)                      # filter/input
+        curses.init_pair(5, curses.COLOR_WHITE,  -1)                      # dim
+        curses.init_pair(6, curses.COLOR_RED,    -1)                      # error
+        self.stdscr.timeout(100)
+
+    # ── Search ───────────────────────────────────────────────────────────────
+
+    def start_search(self, force_rescan: bool = False):
+        self.loading = True
+        def _worker():
+            self.all_dirs = find_claude_dirs(force_rescan=force_rescan)
+            self.apply_filter()
+            self.loading = False
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def apply_filter(self):
+        q = self.query.lower()
+        self.filtered = self.all_dirs[:] if not q else [
+            d for d in self.all_dirs if q in fmt(d).lower()
+        ]
+        self.selected = 0
+        self.scroll    = 0
+
+    # ── Drawing ──────────────────────────────────────────────────────────────
+
+    def draw(self):
+        h, w = self.stdscr.getmaxyx()
+        self.stdscr.erase()
+
+        # Header
+        self.stdscr.attron(curses.color_pair(1) | curses.A_BOLD)
+        self.stdscr.addstr(0, 0, '  ⚡ cgo  —  Claude Code Project Navigator  '.ljust(w)[:w])
+        self.stdscr.attroff(curses.color_pair(1) | curses.A_BOLD)
+
+        # Spinner while loading
+        if self.loading:
+            import time
+            frame = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'[int(time.time() * 10) % 10]
+            self.stdscr.attron(curses.color_pair(5))
+            self.stdscr.addstr(2, 0, f'  {frame}  Scanning for Claude Code projects…'[:w])
+            self.stdscr.attroff(curses.color_pair(5))
+            self.stdscr.refresh()
+            return
+
+        # List
+        list_h = h - 3
+        dirs   = self.filtered
+        if not dirs:
+            self.stdscr.attron(curses.color_pair(5))
+            self.stdscr.addstr(2, 0, '  (no projects found)'[:w])
+            self.stdscr.attroff(curses.color_pair(5))
+        else:
+            if self.selected < self.scroll:
+                self.scroll = self.selected
+            elif self.selected >= self.scroll + list_h:
+                self.scroll = self.selected - list_h + 1
+
+            for i, d in enumerate(dirs[self.scroll:self.scroll + list_h]):
+                idx     = i + self.scroll
+                label   = fmt(d)
+                marker  = ' ✦' if (d / '.planning').exists() else ''
+                display = f'  {label}{marker}'
+                if len(display) > w - 1:
+                    display = '  …' + label[-(w - 6):] + marker
+
+                if idx == self.selected:
+                    self.stdscr.attron(curses.color_pair(2) | curses.A_BOLD)
+                    self.stdscr.addstr(i + 1, 0, display.ljust(w)[:w])
+                    self.stdscr.attroff(curses.color_pair(2) | curses.A_BOLD)
+                else:
+                    self.stdscr.attron(curses.color_pair(3))
+                    try:
+                        self.stdscr.addstr(i + 1, 0, display[:w - 1])
+                    except curses.error:
+                        pass
+                    self.stdscr.attroff(curses.color_pair(3))
+
+        # Clone overlay (drawn on top of list)
+        if self.clone_mode:
+            self._draw_clone_overlay(h, w)
+            return
+
+        # Footer
+        if self.filter_mode:
+            footer = f'  / {self.query}█'
+            self.stdscr.attron(curses.color_pair(4) | curses.A_BOLD)
+        else:
+            count  = f'{self.selected + 1}/{len(dirs)}' if dirs else '0/0'
+            footer = f'  ↑↓ navigate   enter launch   / filter   c clone   r rescan   q quit   [{count}]'
+            self.stdscr.attron(curses.color_pair(1))
+        try:
+            self.stdscr.addstr(h - 1, 0, footer.ljust(w)[:w])
+        except curses.error:
+            pass
+        self.stdscr.attroff(curses.color_pair(1) | curses.color_pair(4) | curses.A_BOLD)
+        self.stdscr.refresh()
+
+    def _draw_clone_overlay(self, h: int, w: int):
+        box_w = min(w - 4, 72)
+        box_h = 7
+        box_y = max(1, h // 2 - box_h // 2)
+        box_x = (w - box_w) // 2
+
+        for row in range(box_y, box_y + box_h):
+            self.stdscr.attron(curses.color_pair(5))
+            try:
+                self.stdscr.addstr(row, box_x, ' ' * box_w)
+            except curses.error:
+                pass
+            self.stdscr.attroff(curses.color_pair(5))
+
+        def put(row, col, text, pair, attrs=0):
+            self.stdscr.attron(curses.color_pair(pair) | attrs)
+            try:
+                self.stdscr.addstr(box_y + row, box_x + col, text[:(box_w - col)])
+            except curses.error:
+                pass
+            self.stdscr.attroff(curses.color_pair(pair) | attrs)
+
+        put(0, 0, f'  Clone a GitHub repo into {CLONE_ROOT.name}/  '.ljust(box_w), 1, curses.A_BOLD)
+        put(1, 0, '', 5)
+        put(2, 2, 'Repo  (name  or  user/repo  or  full URL):', 5)
+        put(3, 2, f'  {self.clone_input}█'.ljust(box_w - 4), 4, curses.A_BOLD)
+        put(4, 0, '', 5)
+        if self.clone_status:
+            put(5, 2, self.clone_status[:(box_w - 4)], 6 if self.clone_error else 3)
+        else:
+            put(5, 2, 'enter confirm   esc cancel', 5)
+        self.stdscr.refresh()
+
+    # ── Actions ──────────────────────────────────────────────────────────────
+
+    def launch(self):
+        if not self.filtered:
+            return
+        target = self.filtered[self.selected]
+        curses.endwin()
+        os.chdir(target)
+        print(f'\n  → {fmt(target)}\n')
+        args = [CLAUDE_BINARY, '--dangerously-skip-permissions']
+        if has_conversations(target):
+            args.insert(1, '--continue')
+        os.execv(CLAUDE_BINARY, args)
+
+    def do_clone(self):
+        repo = self.clone_input.strip()
+        if not repo:
+            return
+
+        # Resolve URL
+        if repo.startswith(('git@', 'http://', 'https://')):
+            url = repo
+        else:
+            if '/' not in repo:
+                repo = f'{GITHUB_USER}/{repo}' if GITHUB_USER else repo
+            url = f'git@github.com:{repo}.git'
+
+        # Destination dir name
+        name = repo.rstrip('/').split('/')[-1].removesuffix('.git')
+        dest = CLONE_ROOT / name
+
+        self.clone_status = f'Cloning {url} …'
+        self.clone_error  = False
+        self.draw()
+
+        try:
+            result = subprocess.run(
+                ['git', 'clone', url, str(dest)],
+                capture_output=True, text=True, timeout=120
+            )
+        except subprocess.TimeoutExpired:
+            self.clone_status = 'Error: clone timed out'
+            self.clone_error  = True
+            return
+
+        if result.returncode != 0:
+            msg = (result.stderr or result.stdout).strip().splitlines()[-1]
+            self.clone_status = f'Error: {msg}'
+            self.clone_error  = True
+            return
+
+        curses.endwin()
+        os.chdir(dest)
+        print(f'\n  Cloned → {dest}\n')
+        os.execv(CLAUDE_BINARY, [CLAUDE_BINARY, '--dangerously-skip-permissions'])
+
+    # ── Event loop ───────────────────────────────────────────────────────────
+
+    def run(self):
+        self.start_search()
+        while True:
+            self.draw()
+            key = self.stdscr.getch()
+            if key == -1:
+                continue
+
+            if self.clone_mode:
+                if key == 27:
+                    self.clone_mode   = False
+                    self.clone_input  = ''
+                    self.clone_status = ''
+                    self.clone_error  = False
+                elif key in (curses.KEY_ENTER, 10, 13):
+                    if self.clone_input.strip():
+                        self.do_clone()
+                elif key in (curses.KEY_BACKSPACE, 127, 8):
+                    self.clone_input  = self.clone_input[:-1]
+                    self.clone_status = ''
+                    self.clone_error  = False
+                elif 32 <= key <= 126:
+                    self.clone_input += chr(key)
+                    self.clone_status = ''
+                    self.clone_error  = False
+
+            elif self.filter_mode:
+                if key in (curses.KEY_ENTER, 10, 13):
+                    self.filter_mode = False
+                elif key == 27:
+                    self.query       = ''
+                    self.filter_mode = False
+                    self.apply_filter()
+                elif key in (curses.KEY_BACKSPACE, 127, 8):
+                    self.query = self.query[:-1]
+                    self.apply_filter()
+                elif 32 <= key <= 126:
+                    self.query += chr(key)
+                    self.apply_filter()
+
+            else:
+                h, _ = self.stdscr.getmaxyx()
+                if key in (ord('q'), ord('Q'), 27):
+                    curses.endwin(); sys.exit(0)
+                elif key in (curses.KEY_UP,   ord('k')) and self.selected > 0:
+                    self.selected -= 1
+                elif key in (curses.KEY_DOWN, ord('j')) and self.filtered and self.selected < len(self.filtered) - 1:
+                    self.selected += 1
+                elif key == curses.KEY_PPAGE:
+                    self.selected = max(0, self.selected - (h - 3))
+                elif key == curses.KEY_NPAGE and self.filtered:
+                    self.selected = min(len(self.filtered) - 1, self.selected + (h - 3))
+                elif key == curses.KEY_HOME:
+                    self.selected = 0
+                elif key == curses.KEY_END and self.filtered:
+                    self.selected = len(self.filtered) - 1
+                elif key == ord('/'):
+                    self.filter_mode = True
+                elif key in (ord('r'), ord('R')):
+                    self.start_search(force_rescan=True)
+                elif key in (ord('c'), ord('C')):
+                    self.clone_mode   = True
+                    self.clone_input  = ''
+                    self.clone_status = ''
+                    self.clone_error  = False
+                elif key in (curses.KEY_ENTER, 10, 13):
+                    self.launch()
+
+
+def main():
+    try:
+        curses.wrapper(lambda s: App(s).run())
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == '__main__':
+    main()
