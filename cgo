@@ -7,21 +7,34 @@ Find all Claude Code projects, navigate with arrow keys, launch with Enter.
 import curses
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
 from pathlib import Path
 
-CLAUDE_BINARY = '/Users/kees/.local/bin/claude'
-SEARCH_ROOT = Path.home()
-CLONE_ROOT = Path('/Users/kees/.nick')  # where cloned repos land
-GITHUB_USER = 'nickbeentjes'
+# Auto-detect Claude binary location
+CLAUDE_BINARY = shutil.which('claude') or os.environ.get('CLAUDE_BINARY', 'claude')
+
+# Use environment variables with sensible defaults
+SEARCH_ROOT = Path(os.environ.get('CGO_SEARCH_ROOT', str(Path.home())))
+CLONE_ROOT = Path(os.environ.get('CGO_CLONE_DIR', str(Path.home())))
+
+# Try to get GitHub user from git config, fallback to env var
+try:
+    result = subprocess.run(['git', 'config', 'github.user'],
+                          capture_output=True, text=True, timeout=5)
+    GITHUB_USER = result.stdout.strip() or os.environ.get('CGO_GITHUB_USER', 'nickbeentjes')
+except:
+    GITHUB_USER = os.environ.get('CGO_GITHUB_USER', 'nickbeentjes')
+
 MAX_DEPTH = 8
 SKIP_DIRS = {
     'node_modules', '__pycache__', '.venv', 'venv', 'env',
     'Library', 'Applications', 'Music', 'Movies', 'Pictures',
     'Downloads', 'Desktop', '.Trash', 'build', 'dist', '.npm',
     '.cache', 'site-packages', 'Pods', 'DerivedData', '.gradle',
+    'AppData', 'ProgramData', 'System Volume Information', '$Recycle.Bin',
 }
 
 
@@ -79,7 +92,6 @@ def find_claude_dirs(force_rescan=False):
         if cached is not None:
             return cached
 
-    home = str(SEARCH_ROOT)
     global_claude = SEARCH_ROOT / '.claude'
     results = set()
 
@@ -96,43 +108,59 @@ def find_claude_dirs(force_rescan=False):
             if entry.is_dir() and any(entry.glob('*.jsonl'))
         }
 
-    # Single find pass — check each dir against all three conditions
-    try:
-        out = subprocess.check_output(
-            ['find', home, '-maxdepth', str(MAX_DEPTH), '-type', 'd',
-             '-not', '-path', '*/node_modules/*',
-             '-not', '-path', '*/.git/*',
-             '-not', '-path', '*/Library/*',
-             '-not', '-path', '*/DerivedData/*',
-             '-not', '-path', '*/.npm/*',
-             '-not', '-path', '*/__pycache__/*',
-             '-not', '-path', '*/Pods/*'],
-            stderr=subprocess.DEVNULL, text=True, timeout=60
-        )
-        for line in out.strip().splitlines():
-            p = Path(line)
-            s = str(p)
+    # Cross-platform directory traversal using Path.walk (Python 3.12+) or os.walk
+    def should_skip(path: Path) -> bool:
+        """Check if directory should be skipped."""
+        name = path.name
+        if name in SKIP_DIRS or name.startswith('.'):
+            return True
+        # Skip if inside global .claude dir
+        try:
+            path.relative_to(global_claude)
+            return True
+        except ValueError:
+            return False
 
-            # Skip anything inside ~/.claude (global config, not a project)
-            if s.startswith(str(global_claude)):
-                continue
+    def scan_directory(root: Path, current_depth: int = 0):
+        """Recursively scan directory up to MAX_DEPTH."""
+        if current_depth > MAX_DEPTH:
+            return
 
-            # Condition 1: has a Claude session in ~/.claude/projects/
-            if session_encoded:
-                if re.sub(r'[^a-zA-Z0-9]', '-', s) in session_encoded:
-                    results.add(p)
+        try:
+            for item in root.iterdir():
+                if not item.is_dir():
                     continue
 
-            # Condition 2: has a .claude/ subdir inside the project
-            if (p / '.claude').exists():
-                results.add(p)
-                continue
+                if should_skip(item):
+                    continue
 
-            # Condition 3: has a CLAUDE.md
-            if (p / 'CLAUDE.md').exists():
-                results.add(p)
+                s = str(item)
 
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+                # Condition 1: has a Claude session in ~/.claude/projects/
+                if session_encoded:
+                    if re.sub(r'[^a-zA-Z0-9]', '-', s) in session_encoded:
+                        results.add(item)
+                        continue
+
+                # Condition 2: has a .claude/ subdir inside the project
+                if (item / '.claude').exists():
+                    results.add(item)
+                    continue
+
+                # Condition 3: has a CLAUDE.md
+                if (item / 'CLAUDE.md').exists():
+                    results.add(item)
+                    continue
+
+                # Recurse into subdirectory
+                scan_directory(item, current_depth + 1)
+
+        except (PermissionError, OSError):
+            pass
+
+    try:
+        scan_directory(SEARCH_ROOT)
+    except Exception:
         pass
 
     # Filter out GSD worktree/workspace sub-directories
