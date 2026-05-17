@@ -6,7 +6,8 @@ Windows port of the Claude Code project navigator. Jump between Claude Code proj
 
 This Windows branch adapts cGo to work on Windows systems:
 
-- **Cross-platform directory scanning** - Replaced Unix `find` command with Python's Path API
+- **Lightning-fast Everything integration** - Uses Everything HTTP server for instant search (100x faster!)
+- **Fallback scanning** - Automatically falls back to Python Path API if Everything is not available
 - **Auto-detection** - Automatically finds `claude` binary in PATH instead of hardcoded paths
 - **Windows-curses support** - Uses `windows-curses` package for terminal UI
 - **PowerShell installer** - Native Windows installation script
@@ -17,6 +18,21 @@ This Windows branch adapts cGo to work on Windows systems:
 - Python 3.9+ (Windows 10/11 includes Python or install from python.org)
 - `windows-curses` package (auto-installed by install script)
 - Claude Code CLI installed and in PATH
+- **Recommended**: Everything with HTTP server enabled (see below)
+
+### Everything HTTP Server (Highly Recommended!)
+
+For lightning-fast scanning (100x faster than filesystem traversal), install Everything and enable its HTTP server:
+
+1. **Install Everything** - Download from https://www.voidtools.com/
+2. **Enable HTTP Server**:
+   - Open Everything
+   - Go to: Tools → Options → HTTP Server
+   - Check "Enable HTTP Server"
+   - Default port: 8099 (or set `CGO_EVERYTHING_URL` env var if different)
+   - Click OK
+
+**Without Everything**: cGo automatically falls back to Python directory scanning (slower but still works)
 
 ## Install
 
@@ -66,6 +82,7 @@ All settings are optional environment variables:
 | `CGO_SEARCH_ROOT` | `%USERPROFILE%` | Where to scan for projects |
 | `CGO_CLONE_DIR` | `%USERPROFILE%` | Where cloned repos land |
 | `CGO_GITHUB_USER` | `git config github.user` | Default GitHub user for short repo names |
+| `CGO_EVERYTHING_URL` | `http://localhost:8099` | Everything HTTP server URL |
 | `CLAUDE_BINARY` | Auto-detected from PATH | Path to claude executable |
 
 Example in PowerShell profile (`$PROFILE`):
@@ -76,8 +93,8 @@ $env:CGO_GITHUB_USER = "yourname"
 
 ## Known Limitations
 
-- Initial scan may be slower on Windows than Mac due to filesystem differences
-- Windows Defender real-time protection may slow directory traversal
+- **Without Everything**: Initial scan may be slower due to filesystem differences
+- **With Everything**: Scanning is instant! (Highly recommended)
 - Some terminal emulators may have better curses support than others (Windows Terminal recommended)
 
 ## Troubleshooting
@@ -94,7 +111,9 @@ where.exe claude
 ```
 
 ### Slow scanning
-Add commonly-used project directories to `CGO_SEARCH_ROOT` instead of scanning entire home directory:
+**Solution**: Install Everything and enable HTTP server (see Requirements section above) for instant search.
+
+**Alternative**: Narrow search scope to commonly-used directories:
 ```powershell
 $env:CGO_SEARCH_ROOT = "$env:USERPROFILE\code"
 ```

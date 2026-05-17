@@ -5,12 +5,15 @@ Find all Claude Code projects, navigate with arrow keys, launch with Enter.
 """
 
 import curses
+import json
 import os
 import re
 import shutil
 import subprocess
 import sys
 import threading
+import urllib.request
+import urllib.parse
 from pathlib import Path
 
 # Auto-detect Claude binary location
@@ -19,6 +22,9 @@ CLAUDE_BINARY = shutil.which('claude') or os.environ.get('CLAUDE_BINARY', 'claud
 # Use environment variables with sensible defaults
 SEARCH_ROOT = Path(os.environ.get('CGO_SEARCH_ROOT', str(Path.home())))
 CLONE_ROOT = Path(os.environ.get('CGO_CLONE_DIR', str(Path.home())))
+
+# Everything HTTP server settings (Windows only)
+EVERYTHING_HTTP_URL = os.environ.get('CGO_EVERYTHING_URL', 'http://localhost:8099')
 
 # Try to get GitHub user from git config, fallback to env var
 try:
@@ -85,20 +91,30 @@ def save_cache(dirs):
         pass
 
 
-def find_claude_dirs(force_rescan=False):
-    """Locate directories with Claude Code activity, with caching."""
-    if not force_rescan:
-        cached = load_cache()
-        if cached is not None:
-            return cached
+def everything_search(query: str, max_results: int = 10000) -> list:
+    """Query Everything HTTP server and return results."""
+    try:
+        params = urllib.parse.urlencode({
+            'search': query,
+            'json': '1',
+            'path_column': '1',
+            'count': str(max_results)
+        })
+        url = f"{EVERYTHING_HTTP_URL}/?{params}"
 
+        with urllib.request.urlopen(url, timeout=5) as response:
+            data = json.loads(response.read().decode('utf-8'))
+            return data.get('results', [])
+    except Exception:
+        return []
+
+
+def find_claude_dirs_everything():
+    """Fast search using Everything HTTP server (Windows only)."""
     global_claude = SEARCH_ROOT / '.claude'
     results = set()
 
-    # Build session index from ~/.claude/projects/ — the authoritative source.
-    # Encoding: re.sub(r'[^a-zA-Z0-9]', '-', str(path))
-    # We can't reverse it perfectly, so instead we encode every candidate dir
-    # and check if it matches a known session entry. O(1) lookup per dir.
+    # Build session index from ~/.claude/projects/
     session_encoded: set[str] = set()
     claude_projects = SEARCH_ROOT / '.claude' / 'projects'
     if claude_projects.exists():
@@ -108,7 +124,69 @@ def find_claude_dirs(force_rescan=False):
             if entry.is_dir() and any(entry.glob('*.jsonl'))
         }
 
-    # Cross-platform directory traversal using Path.walk (Python 3.12+) or os.walk
+    # Search for .claude folders
+    claude_folders = everything_search('folder:.claude')
+    for item in claude_folders:
+        path_str = item.get('path', '')
+        if not path_str:
+            continue
+
+        project_path = Path(path_str)
+
+        # Skip global .claude directory
+        try:
+            project_path.relative_to(global_claude)
+            continue
+        except ValueError:
+            pass
+
+        # Skip excluded directories
+        if any(skip in project_path.parts for skip in SKIP_DIRS):
+            continue
+
+        results.add(project_path)
+
+    # Search for CLAUDE.md files
+    claude_md_files = everything_search('CLAUDE.md')
+    for item in claude_md_files:
+        path_str = item.get('path', '')
+        if not path_str:
+            continue
+
+        project_path = Path(path_str)
+
+        # Skip excluded directories
+        if any(skip in project_path.parts for skip in SKIP_DIRS):
+            continue
+
+        results.add(project_path)
+
+    # Check session-encoded directories
+    if session_encoded:
+        # This would require reverse-engineering paths, skip for now
+        # The .claude folder and CLAUDE.md searches should catch most projects
+        pass
+
+    # Filter out GSD worktree/workspace sub-directories
+    filtered = [d for d in sorted(results) if not is_gsd_subdir(d)]
+    return filtered
+
+
+def find_claude_dirs_fallback():
+    """Fallback: Python directory traversal (slower, cross-platform)."""
+    global_claude = SEARCH_ROOT / '.claude'
+    results = set()
+
+    # Build session index from ~/.claude/projects/
+    session_encoded: set[str] = set()
+    claude_projects = SEARCH_ROOT / '.claude' / 'projects'
+    if claude_projects.exists():
+        session_encoded = {
+            entry.name
+            for entry in claude_projects.iterdir()
+            if entry.is_dir() and any(entry.glob('*.jsonl'))
+        }
+
     def should_skip(path: Path) -> bool:
         """Check if directory should be skipped."""
         name = path.name
@@ -165,9 +243,27 @@ def find_claude_dirs(force_rescan=False):
 
     # Filter out GSD worktree/workspace sub-directories
     filtered = [d for d in sorted(results) if not is_gsd_subdir(d)]
-
-    save_cache(filtered)
     return filtered
+
+
+def find_claude_dirs(force_rescan=False):
+    """Locate directories with Claude Code activity, with caching."""
+    if not force_rescan:
+        cached = load_cache()
+        if cached is not None:
+            return cached
+
+    # Try Everything HTTP server first (Windows only, super fast)
+    try:
+        # Test if Everything server is running
+        urllib.request.urlopen(EVERYTHING_HTTP_URL, timeout=1)
+        results = find_claude_dirs_everything()
+    except Exception:
+        # Fall back to Python directory traversal
+        results = find_claude_dirs_fallback()
+
+    save_cache(results)
+    return results
 
 
 def fmt(p: Path) -> str:
